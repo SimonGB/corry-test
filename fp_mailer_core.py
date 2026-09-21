@@ -1,16 +1,21 @@
 from __future__ import annotations
 
 import re
+import smtplib
+import ssl
 from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Iterable
 from urllib.parse import parse_qs, urlparse, urljoin
+from email.message import EmailMessage
 
 import requests
 from bs4 import BeautifulSoup
 
 FP_URL = "https://www.physi.uni-heidelberg.de/cgi-bin/fp/fp-testate.pl"
+SMTP_HOST = "mail.urz.uni-heidelberg.de"
+SMTP_PORT = 587
 DEFAULT_CODES = ("E01", "E06", "E07", "E08", "E09")
 GERMAN_WEEKDAYS = {
     0: "Montag", 1: "Dienstag", 2: "Mittwoch", 3: "Donnerstag",
@@ -373,6 +378,64 @@ Viele Grüße
 Simon
 """
     return subject, body
+
+
+def infer_sender_email(html: str) -> str | None:
+    """Infer the tutor's email address from reply=/cc= in a mail.pl link."""
+    soup = BeautifulSoup(html, "html.parser")
+    for anchor in soup.find_all("a", href=True):
+        parsed = urlparse(anchor.get("href", ""))
+        if "mail.pl" not in parsed.path:
+            continue
+        query = parse_qs(parsed.query, keep_blank_values=True)
+        for key in ("reply", "cc"):
+            for value in query.get(key, []):
+                for addr in re.split(r"[,;]", value):
+                    addr = addr.strip().lower()
+                    if EMAIL_RE.match(addr):
+                        return addr
+    return None
+
+
+def send_email_via_uni_smtp(
+    *,
+    sender_email: str,
+    uni_id: str,
+    password: str,
+    recipient_emails: list[str],
+    subject: str,
+    body: str,
+    timeout: int = 30,
+) -> None:
+    """Send one message through Heidelberg University's SMTP server."""
+    if not EMAIL_RE.match(sender_email):
+        raise ValueError(f"Ungültige Absenderadresse: {sender_email!r}")
+    recipient_emails = sorted({
+        e.strip().lower()
+        for e in recipient_emails
+        if EMAIL_RE.match(e.strip())
+    })
+    if not recipient_emails:
+        raise ValueError("Keine gültigen Empfängeradressen vorhanden.")
+    if not subject.strip():
+        raise ValueError("Der Betreff ist leer.")
+    if not body.strip():
+        raise ValueError("Der Mailtext ist leer.")
+
+    msg = EmailMessage()
+    msg["From"] = sender_email
+    msg["To"] = sender_email
+    msg["Bcc"] = ", ".join(recipient_emails)
+    msg["Subject"] = subject.strip()
+    msg.set_content(body.rstrip() + "\n")
+
+    context = ssl.create_default_context()
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=timeout) as smtp:
+        smtp.ehlo()
+        smtp.starttls(context=context)
+        smtp.ehlo()
+        smtp.login(uni_id, password)
+        smtp.send_message(msg)
 
 def looks_logged_in(html: str) -> bool:
     soup = BeautifulSoup(html, "html.parser")
