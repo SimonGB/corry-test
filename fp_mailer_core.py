@@ -60,114 +60,177 @@ def extract_mail_link_emails(row) -> set[str]:
                     found.add(addr)
     return found
 
-def _row_values(row) -> list[str]:
-    cells = row.find_all(["td", "th"], recursive=False)
-    if not cells:
-        cells = row.find_all(["td", "th"])
-    return [clean(c.get_text(" ", strip=True)) for c in cells]
+def _selected_option(select):
+    """Return the currently selected <option> of a <select> element."""
+    if select is None:
+        return None
+    selected = select.find("option", selected=True)
+    if selected is not None:
+        return selected
+    return select.find("option")
 
-def _find_experiment(values: list[str], codes: set[str]) -> tuple[str | None, int | None]:
-    for i, value in enumerate(values):
-        candidate = value.upper().strip()
-        if candidate in codes:
-            return candidate, i
-    return None, None
 
-def _find_date(values: list[str], experiment_index: int | None = None) -> tuple[date | None, int | None]:
-    indices = list(range(len(values)))
-    if experiment_index is not None:
-        indices = list(range(experiment_index + 1, len(values))) + list(range(0, experiment_index))
-    for i in indices:
-        value = values[i]
-        if not DATE_RE.match(value):
-            continue
-        try:
-            return parse_fp_date(value), i
-        except ValueError:
-            pass
-    return None, None
+def _selected_status(row) -> tuple[str, str]:
+    select = row.find("select", attrs={"name": re.compile(r"^Status\\s", re.I)})
+    option = _selected_option(select)
+    if option is None:
+        return "", ""
+    return clean(option.get("value", "")).lower(), clean(option.get_text(" ", strip=True)).lower()
 
-def _status_from_values(values: list[str]) -> str:
-    lowered = [clean(v).lower() for v in values]
-    if "eingeteilt" in lowered:
-        return "eingeteilt"
-    for value in lowered:
-        if re.search(r"\beingeteilt\b", value):
-            return "eingeteilt"
-    return ""
 
-def parse_participants(html: str, codes: set[str] | None = None) -> list[Participant]:
+def _selected_supervisor(row) -> tuple[str, str]:
+    select = row.find("select", attrs={"name": re.compile(r"^Betreuer\\s", re.I)})
+    option = _selected_option(select)
+    if option is None:
+        return "", ""
+    return clean(option.get("value", "")), clean(option.get_text(" ", strip=True))
+
+
+def _supervisor_matches(supervisor_id: str, supervisor_name: str, *, target_id: str, target_name: str) -> bool:
+    if target_id and supervisor_id == target_id:
+        return True
+    return clean(supervisor_name).casefold() == clean(target_name).casefold()
+
+
+def parse_participants(
+    html: str,
+    codes: set[str] | None = None,
+    *,
+    supervisor_id: str = "1370",
+    supervisor_name: str = "Simon Groß-Bölting",
+) -> list[Participant]:
+    """Parse rows assigned to this supervisor from the FP testate table.
+
+    Direct table cells are:
+      td[0] student, td[1] experiment, td[2] experiment date, ...
+
+    Assignment is determined by the selected option in the Betreuer dropdown.
+    Open/future attempts normally have an empty selected Status option.
+    """
     codes = {c.upper() for c in (codes or set(DEFAULT_CODES))}
     soup = BeautifulSoup(html, "html.parser")
     participants: list[Participant] = []
 
     for row in soup.find_all("tr"):
-        values = _row_values(row)
-        if not values:
+        cells = row.find_all("td", recursive=False)
+        if len(cells) < 3:
             continue
-        experiment, exp_index = _find_experiment(values, codes)
-        if not experiment:
+
+        name = clean(cells[0].get_text(" ", strip=True))
+        experiment = clean(cells[1].get_text(" ", strip=True)).upper()
+        date_text = clean(cells[2].get_text(" ", strip=True))
+
+        if experiment not in codes:
             continue
-        status = _status_from_values(values)
-        if status != "eingeteilt":
+
+        try:
+            session_date = parse_fp_date(date_text)
+        except ValueError:
             continue
-        session_date, _ = _find_date(values, exp_index)
-        if session_date is None:
+
+        selected_supervisor_id, selected_supervisor_name = _selected_supervisor(row)
+        if not _supervisor_matches(
+            selected_supervisor_id,
+            selected_supervisor_name,
+            target_id=supervisor_id,
+            target_name=supervisor_name,
+        ):
             continue
-        name = values[0] if values else ""
-        if exp_index is not None and exp_index > 0:
-            before = [v for v in values[:exp_index] if v]
-            if before:
-                name = before[-1]
-        name = clean(name) or "Unbekannt"
+
+        status_value, status_text = _selected_status(row)
+        if status_value == "nicht":
+            continue
+
         emails = tuple(sorted(extract_mail_link_emails(row)))
         if not emails:
             raise RuntimeError(
-                f"Eingeteilter Eintrag ohne erkennbare E-Mail-Adresse: "
+                f"Zugeordneter Eintrag ohne erkennbare E-Mail-Adresse: "
                 f"{experiment} / {session_date.strftime('%d.%m.%Y')}"
             )
-        participants.append(Participant(name, experiment, session_date, emails, status))
+
+        participants.append(
+            Participant(
+                name=name or "Unbekannt",
+                experiment=experiment,
+                session_date=session_date,
+                emails=emails,
+                status=status_value or status_text,
+            )
+        )
+
     return participants
 
-def diagnostic_summary(html: str, codes: set[str] | None = None) -> str:
+
+def diagnostic_summary(
+    html: str,
+    codes: set[str] | None = None,
+    *,
+    supervisor_id: str = "1370",
+    supervisor_name: str = "Simon Groß-Bölting",
+) -> str:
+    """PII-light diagnostics: no student names, passwords or email addresses."""
     codes = {c.upper() for c in (codes or set(DEFAULT_CODES))}
     soup = BeautifulSoup(html, "html.parser")
     rows = soup.find_all("tr")
-    code_rows = []
+
+    electronics_rows = []
+    supervisor_counter: Counter[str] = Counter()
     status_counter: Counter[str] = Counter()
     date_counter: Counter[str] = Counter()
-    mail_rows = 0
+    own_rows = 0
 
     for row in rows:
-        values = _row_values(row)
-        experiment, exp_index = _find_experiment(values, codes)
-        if not experiment:
+        cells = row.find_all("td", recursive=False)
+        if len(cells) < 3:
             continue
-        status = _status_from_values(values) or "<kein eingeteilt-Status erkannt>"
-        session_date, _ = _find_date(values, exp_index)
+
+        experiment = clean(cells[1].get_text(" ", strip=True)).upper()
+        if experiment not in codes:
+            continue
+
+        date_text = clean(cells[2].get_text(" ", strip=True))
+        try:
+            session_date = parse_fp_date(date_text)
+            d = session_date.isoformat()
+            date_counter[d] += 1
+        except ValueError:
+            d = "?"
+
+        sup_id, sup_name = _selected_supervisor(row)
+        supervisor_counter[sup_id or "<leer>"] += 1
+        is_own = _supervisor_matches(
+            sup_id, sup_name, target_id=supervisor_id, target_name=supervisor_name
+        )
+        if is_own:
+            own_rows += 1
+
+        status_value, status_text = _selected_status(row)
+        status_label = status_value or status_text or "<leer>"
+        status_counter[status_label] += 1
         mail_count = len(extract_mail_link_emails(row))
-        if mail_count:
-            mail_rows += 1
-        status_counter[status] += 1
-        if session_date:
-            date_counter[session_date.isoformat()] += 1
-        code_rows.append((experiment, session_date.isoformat() if session_date else "?", status, len(values), mail_count))
+        electronics_rows.append((experiment, d, sup_id or "<leer>", status_label, mail_count, is_own))
 
     lines = [
         f"Lokales Datum: {date.today().isoformat()}",
         f"Tabellenzeilen gesamt: {len(rows)}",
-        f"Elektronik-Zeilen erkannt: {len(code_rows)}",
-        f"Elektronik-Zeilen mit mail.pl-Adresse: {mail_rows}",
+        f"Elektronik-Zeilen erkannt: {len(electronics_rows)}",
+        f"Davon Betreuer {supervisor_id}: {own_rows}",
+        "Betreuer-ID-Verteilung: " + (", ".join(f"{k}={v}" for k, v in supervisor_counter.items()) or "<leer>"),
         "Status-Verteilung: " + (", ".join(f"{k}={v}" for k, v in status_counter.items()) or "<leer>"),
         "Erkannte Versuchstermine: " + (", ".join(f"{k} ({v} Zeilen)" for k, v in sorted(date_counter.items())) or "<keine>"),
         "",
-        "Erste erkannte Elektronik-Zeilen (ohne Namen/E-Mail-Adressen):",
+        "Erste Elektronik-Zeilen (ohne Namen/E-Mail-Adressen):",
     ]
-    for experiment, d, status, n_cells, mail_count in code_rows[:30]:
-        lines.append(f"- {experiment} | Datum={d} | Status={status} | Spalten={n_cells} | MailLinks={mail_count}")
-    if len(code_rows) > 30:
-        lines.append(f"... {len(code_rows) - 30} weitere Zeilen")
+    for experiment, d, sup_id, status, mail_count, is_own in electronics_rows[:40]:
+        own = "JA" if is_own else "nein"
+        lines.append(
+            f"- {experiment} | Datum={d} | BetreuerID={sup_id} | Eigene={own} | "
+            f"Status={status} | MailLinks={mail_count}"
+        )
+    if len(electronics_rows) > 40:
+        lines.append(f"... {len(electronics_rows) - 40} weitere Zeilen")
     return "\n".join(lines)
+
 
 def group_participants(participants: Iterable[Participant]) -> list[Group]:
     buckets: dict[tuple[date, str], dict[str, set[str]]] = {}
@@ -186,7 +249,7 @@ def choose_next_session(groups: Iterable[Group], today: date | None = None) -> t
     today = today or date.today()
     future = [g for g in groups if g.session_date >= today]
     if not future:
-        raise RuntimeError("Keine zukünftigen eingeteilten Elektronik-Gruppen gefunden.")
+        raise RuntimeError("Keine zukünftigen dir zugeordneten Elektronik-Gruppen gefunden.")
     next_date = min(g.session_date for g in future)
     return next_date, [g for g in future if g.session_date == next_date]
 
