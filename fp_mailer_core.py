@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import re
+from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Iterable
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlparse, urljoin
 
 import requests
 from bs4 import BeautifulSoup
@@ -16,6 +17,7 @@ GERMAN_WEEKDAYS = {
     4: "Freitag", 5: "Samstag", 6: "Sonntag",
 }
 EMAIL_RE = re.compile(r"^[^@\s,;]+@[^@\s,;]+\.[^@\s,;]+$")
+DATE_RE = re.compile(r"^\d{1,2}\.\d{1,2}\.(?:\d{2}|\d{4})$")
 
 @dataclass(frozen=True)
 class Participant:
@@ -33,7 +35,7 @@ class Group:
     emails: tuple[str, ...]
 
 def clean(text: str) -> str:
-    return " ".join((text or "").split())
+    return " ".join((text or "").replace("\xa0", " ").split())
 
 def parse_fp_date(text: str) -> date:
     text = clean(text)
@@ -58,31 +60,114 @@ def extract_mail_link_emails(row) -> set[str]:
                     found.add(addr)
     return found
 
-def parse_participants(html: str, codes: set[str] | None = None) -> list[Participant]:
-    codes = codes or set(DEFAULT_CODES)
-    soup = BeautifulSoup(html, "html.parser")
-    participants: list[Participant] = []
-    for row in soup.find_all("tr"):
-        cells = row.find_all(["td", "th"], recursive=False)
-        if len(cells) < 7:
-            continue
-        values = [clean(c.get_text(" ", strip=True)) for c in cells]
-        name, experiment, date_text = values[0], values[1].upper(), values[2]
-        status = values[6].lower()
-        if experiment not in codes or status != "eingeteilt":
+def _row_values(row) -> list[str]:
+    cells = row.find_all(["td", "th"], recursive=False)
+    if not cells:
+        cells = row.find_all(["td", "th"])
+    return [clean(c.get_text(" ", strip=True)) for c in cells]
+
+def _find_experiment(values: list[str], codes: set[str]) -> tuple[str | None, int | None]:
+    for i, value in enumerate(values):
+        candidate = value.upper().strip()
+        if candidate in codes:
+            return candidate, i
+    return None, None
+
+def _find_date(values: list[str], experiment_index: int | None = None) -> tuple[date | None, int | None]:
+    indices = list(range(len(values)))
+    if experiment_index is not None:
+        indices = list(range(experiment_index + 1, len(values))) + list(range(0, experiment_index))
+    for i in indices:
+        value = values[i]
+        if not DATE_RE.match(value):
             continue
         try:
-            session_date = parse_fp_date(date_text)
+            return parse_fp_date(value), i
         except ValueError:
+            pass
+    return None, None
+
+def _status_from_values(values: list[str]) -> str:
+    lowered = [clean(v).lower() for v in values]
+    if "eingeteilt" in lowered:
+        return "eingeteilt"
+    for value in lowered:
+        if re.search(r"\beingeteilt\b", value):
+            return "eingeteilt"
+    return ""
+
+def parse_participants(html: str, codes: set[str] | None = None) -> list[Participant]:
+    codes = {c.upper() for c in (codes or set(DEFAULT_CODES))}
+    soup = BeautifulSoup(html, "html.parser")
+    participants: list[Participant] = []
+
+    for row in soup.find_all("tr"):
+        values = _row_values(row)
+        if not values:
             continue
+        experiment, exp_index = _find_experiment(values, codes)
+        if not experiment:
+            continue
+        status = _status_from_values(values)
+        if status != "eingeteilt":
+            continue
+        session_date, _ = _find_date(values, exp_index)
+        if session_date is None:
+            continue
+        name = values[0] if values else ""
+        if exp_index is not None and exp_index > 0:
+            before = [v for v in values[:exp_index] if v]
+            if before:
+                name = before[-1]
+        name = clean(name) or "Unbekannt"
         emails = tuple(sorted(extract_mail_link_emails(row)))
         if not emails:
             raise RuntimeError(
                 f"Eingeteilter Eintrag ohne erkennbare E-Mail-Adresse: "
-                f"{name} / {experiment} / {date_text}"
+                f"{experiment} / {session_date.strftime('%d.%m.%Y')}"
             )
         participants.append(Participant(name, experiment, session_date, emails, status))
     return participants
+
+def diagnostic_summary(html: str, codes: set[str] | None = None) -> str:
+    codes = {c.upper() for c in (codes or set(DEFAULT_CODES))}
+    soup = BeautifulSoup(html, "html.parser")
+    rows = soup.find_all("tr")
+    code_rows = []
+    status_counter: Counter[str] = Counter()
+    date_counter: Counter[str] = Counter()
+    mail_rows = 0
+
+    for row in rows:
+        values = _row_values(row)
+        experiment, exp_index = _find_experiment(values, codes)
+        if not experiment:
+            continue
+        status = _status_from_values(values) or "<kein eingeteilt-Status erkannt>"
+        session_date, _ = _find_date(values, exp_index)
+        mail_count = len(extract_mail_link_emails(row))
+        if mail_count:
+            mail_rows += 1
+        status_counter[status] += 1
+        if session_date:
+            date_counter[session_date.isoformat()] += 1
+        code_rows.append((experiment, session_date.isoformat() if session_date else "?", status, len(values), mail_count))
+
+    lines = [
+        f"Lokales Datum: {date.today().isoformat()}",
+        f"Tabellenzeilen gesamt: {len(rows)}",
+        f"Elektronik-Zeilen erkannt: {len(code_rows)}",
+        f"Elektronik-Zeilen mit mail.pl-Adresse: {mail_rows}",
+        "Status-Verteilung: " + (", ".join(f"{k}={v}" for k, v in status_counter.items()) or "<leer>"),
+        "Erkannte Versuchstermine: " + (", ".join(f"{k} ({v} Zeilen)" for k, v in sorted(date_counter.items())) or "<keine>"),
+        "",
+        "Erste erkannte Elektronik-Zeilen (ohne Namen/E-Mail-Adressen):",
+    ]
+    for experiment, d, status, n_cells, mail_count in code_rows[:30]:
+        lines.append(f"- {experiment} | Datum={d} | Status={status} | Spalten={n_cells} | MailLinks={mail_count}")
+    if len(code_rows) > 30:
+        lines.append(f"... {len(code_rows) - 30} weitere Zeilen")
+    return "\n".join(lines)
 
 def group_participants(participants: Iterable[Participant]) -> list[Group]:
     buckets: dict[tuple[date, str], dict[str, set[str]]] = {}
@@ -168,7 +253,7 @@ def _form_payload(form, uni_id: str, password: str):
     for inp in form.find_all("input"):
         name = inp.get("name")
         typ = (inp.get("type") or "text").lower()
-        if name and inp is not pw and typ in {"text","email","search",""}:
+        if name and inp is not pw and typ in {"text", "email", "search", ""}:
             candidates.append(inp)
     if not candidates:
         raise RuntimeError("Loginformular ohne erkanntes Uni-ID-Feld.")
@@ -184,7 +269,7 @@ def fetch_live_page(uni_id: str, password: str, timeout: int = 30) -> str:
     if not uni_id or not password:
         raise RuntimeError("Uni-ID oder Passwort fehlt.")
     session = requests.Session()
-    session.headers.update({"User-Agent": "Mozilla/5.0 FP-Mailer-Desktop/0.1"})
+    session.headers.update({"User-Agent": "Mozilla/5.0 FP-Mailer-Desktop/0.2"})
     r = session.get(FP_URL, timeout=timeout)
     r.raise_for_status()
     if looks_logged_in(r.text):
@@ -194,7 +279,6 @@ def fetch_live_page(uni_id: str, password: str, timeout: int = 30) -> str:
     if form is None:
         raise RuntimeError("Kein Loginformular und keine Testattabelle gefunden.")
     payload = _form_payload(form, uni_id, password)
-    from urllib.parse import urljoin
     action = urljoin(r.url, form.get("action") or r.url)
     method = (form.get("method") or "get").lower()
     r2 = session.post(action, data=payload, timeout=timeout) if method == "post" else session.get(action, params=payload, timeout=timeout)
