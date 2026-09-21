@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import os
-import smtplib
 import traceback
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import quote, urlencode
 import tkinter as tk
 from tkinter import messagebox, simpledialog
 
@@ -21,8 +20,6 @@ from fp_mailer_core import (
     choose_next_session,
     recipients,
     build_mail,
-    infer_sender_email,
-    send_email_via_uni_smtp,
 )
 
 APP_NAME = "FP Mailer"
@@ -31,7 +28,6 @@ CONFIG_DIR = Path(os.getenv("LOCALAPPDATA", Path.home())) / "FP-Mailer"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 LOG_FILE = CONFIG_DIR / "fp_mailer.log"
 DEBUG_FILE = CONFIG_DIR / "debug_parse.txt"
-SENT_FILE = CONFIG_DIR / "sent_sessions.json"
 
 
 def log(msg: str) -> None:
@@ -52,18 +48,6 @@ def save_config(cfg: dict) -> None:
     CONFIG_FILE.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-def load_sent_state() -> dict:
-    try:
-        return json.loads(SENT_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-
-
-def save_sent_state(state: dict) -> None:
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    SENT_FILE.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
-
-
 def ask_credentials(root: tk.Tk, force: bool = False) -> tuple[str, str]:
     cfg = load_config()
     uni_id = cfg.get("uni_id", "")
@@ -71,39 +55,22 @@ def ask_credentials(root: tk.Tk, force: bool = False) -> tuple[str, str]:
     if uni_id and password and not force:
         return uni_id, password
 
-    uni_id = simpledialog.askstring("FP Mailer – Einrichtung", "Uni-ID:", initialvalue=uni_id, parent=root)
+    uni_id = simpledialog.askstring(
+        "FP Mailer – Einrichtung", "Uni-ID:", initialvalue=uni_id, parent=root
+    )
     if not uni_id:
         raise RuntimeError("Einrichtung abgebrochen: keine Uni-ID angegeben.")
-    password = simpledialog.askstring("FP Mailer – Einrichtung", "Uni-Passwort:", show="•", parent=root)
+    password = simpledialog.askstring(
+        "FP Mailer – Einrichtung", "Uni-Passwort:", show="•", parent=root
+    )
     if not password:
         raise RuntimeError("Einrichtung abgebrochen: kein Passwort angegeben.")
 
     cfg["uni_id"] = uni_id.strip()
+    cfg.pop("sender_email", None)
     save_config(cfg)
     keyring.set_password(KEYRING_SERVICE, uni_id.strip(), password)
     return uni_id.strip(), password
-
-
-def ensure_sender_email(root: tk.Tk, inferred: str | None) -> str:
-    cfg = load_config()
-    sender = inferred or cfg.get("sender_email", "")
-    if sender:
-        if cfg.get("sender_email") != sender:
-            cfg["sender_email"] = sender
-            save_config(cfg)
-        return sender
-
-    sender = simpledialog.askstring(
-        "FP Mailer – Absender",
-        "Deine Uni-E-Mail-Adresse, von der versendet werden soll:",
-        parent=root,
-    )
-    if not sender:
-        raise RuntimeError("Keine Absenderadresse angegeben.")
-    sender = sender.strip().lower()
-    cfg["sender_email"] = sender
-    save_config(cfg)
-    return sender
 
 
 def compact_summary(session_date, groups) -> str:
@@ -113,33 +80,12 @@ def compact_summary(session_date, groups) -> str:
         "",
     ]
     for g in groups:
-        lines.append(f"{g.experiment}: {'; '.join(g.names)}")
-    lines += ["", "Empfänger:", "; ".join(recips)]
+        lines.append(g.experiment)
+        for name in g.names:
+            lines.append(f"  • {name}")
+        lines.append("")
+    lines += ["Empfänger (BCC):", "; ".join(recips)]
     return "\n".join(lines)
-
-
-def recipients_digest(recips: list[str]) -> str:
-    payload = "\n".join(sorted(r.lower() for r in recips)).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
-
-
-def already_sent_info(session_date, recips: list[str]) -> dict | None:
-    state = load_sent_state()
-    item = state.get(session_date.isoformat())
-    if not item or item.get("recipient_digest") != recipients_digest(recips):
-        return None
-    return item
-
-
-def mark_sent(session_date, recips: list[str], subject: str) -> None:
-    state = load_sent_state()
-    state[session_date.isoformat()] = {
-        "sent_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-        "recipient_count": len(recips),
-        "recipient_digest": recipients_digest(recips),
-        "subject": subject,
-    }
-    save_sent_state(state)
 
 
 def reset_credentials(root: tk.Tk) -> None:
@@ -161,14 +107,30 @@ def reset_credentials(root: tk.Tk) -> None:
         messagebox.showwarning(APP_NAME, str(e), parent=root)
 
 
-def send_from_window(
+def build_mailto_uri(recips: list[str], subject: str, body: str) -> str:
+    recips = sorted({r.strip().lower() for r in recips if r.strip()})
+    if not recips:
+        raise ValueError("Keine Empfänger vorhanden.")
+    if not subject.strip():
+        raise ValueError("Der Betreff ist leer.")
+    if not body.strip():
+        raise ValueError("Der Mailtext ist leer.")
+
+    query = urlencode(
+        {
+            "bcc": ",".join(recips),
+            "subject": subject.strip(),
+            "body": body.rstrip(),
+        },
+        quote_via=quote,
+        safe="@,",
+    )
+    return f"mailto:?{query}"
+
+
+def open_mail_app(
     root: tk.Tk,
-    send_button: tk.Button,
-    session_date,
     groups,
-    sender_email: str,
-    uni_id: str,
-    password: str,
     subject_var: tk.StringVar,
     body_widget: tk.Text,
 ) -> None:
@@ -176,81 +138,25 @@ def send_from_window(
     subject = subject_var.get().strip()
     body = body_widget.get("1.0", "end-1c").strip()
 
-    previous = already_sent_info(session_date, recips)
-    if previous:
-        sent_at = previous.get("sent_at", "unbekannt")
-        if not messagebox.askyesno(
-            "Bereits versendet",
-            f"Für diesen Termin und genau diese Empfängerliste wurde bereits eine E-Mail versendet.\n\n"
-            f"Gesendet: {sent_at}\nEmpfänger: {len(recips)}\n\nTrotzdem erneut senden?",
-            parent=root,
-        ):
-            return
-
-    preview_names = "\n".join(f"• {g.experiment}: {', '.join(g.names)}" for g in groups)
-    if not messagebox.askyesno(
-        "E-Mail wirklich absenden?",
-        f"Absender: {sender_email}\n"
-        f"Termin: {session_date.strftime('%d.%m.%Y')}\n"
-        f"Empfänger: {len(recips)} (BCC)\n\n"
-        f"{preview_names}\n\n"
-        "Die E-Mail wird jetzt wirklich versendet. Fortfahren?",
-        parent=root,
-    ):
-        return
-
-    send_button.configure(state="disabled", text="Wird gesendet …")
-    root.update_idletasks()
-
     try:
-        send_email_via_uni_smtp(
-            sender_email=sender_email,
-            uni_id=uni_id,
-            password=password,
-            recipient_emails=recips,
-            subject=subject,
-            body=body,
-        )
-        mark_sent(session_date, recips, subject)
-        log(f"Mail gesendet: {session_date.isoformat()}, {len(recips)} Empfänger")
-        send_button.configure(text="E-Mail gesendet ✓", state="disabled")
-        messagebox.showinfo(
-            "E-Mail gesendet",
-            f"Die E-Mail wurde erfolgreich an {len(recips)} Empfänger versendet.\n\n"
-            "Die Adressen wurden als BCC verwendet.",
-            parent=root,
-        )
-    except smtplib.SMTPAuthenticationError:
-        log("SMTP-Authentifizierung fehlgeschlagen")
-        send_button.configure(state="normal", text="E-Mail absenden")
-        messagebox.showerror(
-            "Versand fehlgeschlagen",
-            "Die Anmeldung am Uni-Mailserver wurde abgelehnt. Bitte Uni-ID/Passwort prüfen.",
-            parent=root,
-        )
+        uri = build_mailto_uri(recips, subject, body)
+        os.startfile(uri)
+        log(f"Mail-App geöffnet: {len(recips)} BCC-Empfänger, mailto-Länge={len(uri)}")
     except Exception as e:
-        log("SMTP-Fehler: " + repr(e))
-        send_button.configure(state="normal", text="E-Mail absenden")
+        log("Mail-App konnte nicht geöffnet werden: " + repr(e))
         messagebox.showerror(
-            "Versand fehlgeschlagen",
-            f"Die E-Mail konnte nicht versendet werden:\n\n{e}\n\n"
-            "Falls du nicht in Deutschland bzw. nicht im Uni-Netz bist, verbinde zuerst das Uni-VPN.",
+            "Mail-App konnte nicht geöffnet werden",
+            "Windows konnte keine Standard-App für E-Mail öffnen.\n\n"
+            "Bitte unter Windows Einstellungen → Apps → Standard-Apps eine App für den Linktyp MAILTO festlegen "
+            "(z. B. Outlook) und danach erneut versuchen.\n\n"
+            f"Technischer Fehler: {e}",
             parent=root,
         )
 
 
-def show_result(
-    root: tk.Tk,
-    session_date,
-    groups,
-    sender_email: str,
-    uni_id: str,
-    password: str,
-    subject: str,
-    body: str,
-) -> None:
+def show_result(root: tk.Tk, session_date, groups, subject: str, body: str) -> None:
     root.deiconify()
-    root.title("FP Mailer – Vorschau & Versand")
+    root.title("FP Mailer – Vorschau")
     root.geometry("900x820")
     root.minsize(760, 650)
 
@@ -260,21 +166,31 @@ def show_result(
     tk.Label(outer, text="FP Mailer", font=("Segoe UI", 16, "bold")).pack(anchor="w")
     tk.Label(
         outer,
-        text="Bitte Empfänger und Mailtext prüfen. Gesendet wird erst nach Klick auf „E-Mail absenden“ und einer zusätzlichen Bestätigung.",
+        text=(
+            "Bitte Empfänger, Betreff und Mailtext prüfen. „In Mail-App öffnen“ erstellt nur einen neuen Entwurf "
+            "in deiner Standard-Mail-App. Der FP Mailer kann selbst keine E-Mail versenden."
+        ),
         font=("Segoe UI", 10),
         wraplength=850,
         justify="left",
     ).pack(anchor="w", pady=(2, 10))
 
-    summary = tk.Text(outer, height=max(8, 5 + len(groups)), wrap="word", font=("Segoe UI", 10))
+    summary = tk.Text(
+        outer,
+        height=max(10, 7 + 3 * len(groups)),
+        wrap="word",
+        font=("Segoe UI", 10),
+    )
     summary.pack(fill="x", pady=(0, 10))
     summary.insert("1.0", compact_summary(session_date, groups))
     summary.configure(state="disabled")
 
-    meta = tk.Frame(outer)
-    meta.pack(fill="x", pady=(0, 8))
-    tk.Label(meta, text="Von:", width=10, anchor="w").pack(side="left")
-    tk.Label(meta, text=sender_email, anchor="w").pack(side="left")
+    tk.Label(
+        outer,
+        text="Absenderkonto: wird von deiner Standard-Mail-App festgelegt",
+        anchor="w",
+        font=("Segoe UI", 9),
+    ).pack(fill="x", pady=(0, 8))
 
     subject_frame = tk.Frame(outer)
     subject_frame.pack(fill="x", pady=(0, 8))
@@ -295,31 +211,12 @@ def show_result(
         command=lambda: reset_credentials(root),
     ).pack(side="left")
     tk.Button(buttons, text="Schließen", command=root.destroy, width=14).pack(side="right")
-    send_button = tk.Button(buttons, text="E-Mail absenden", width=18)
-    send_button.pack(side="right", padx=(0, 8))
-    send_button.configure(
-        command=lambda: send_from_window(
-            root,
-            send_button,
-            session_date,
-            groups,
-            sender_email,
-            uni_id,
-            password,
-            subject_var,
-            body_widget,
-        )
-    )
-
-    recips = recipients(groups)
-    previous = already_sent_info(session_date, recips)
-    if previous:
-        tk.Label(
-            outer,
-            text=f"Hinweis: Für genau diese Empfängerliste wurde bereits am {previous.get('sent_at', 'unbekannt')} gesendet.",
-            font=("Segoe UI", 9),
-            anchor="w",
-        ).pack(fill="x", pady=(8, 0))
+    tk.Button(
+        buttons,
+        text="In Mail-App öffnen",
+        width=20,
+        command=lambda: open_mail_app(root, groups, subject_var, body_widget),
+    ).pack(side="right", padx=(0, 8))
 
 
 def save_diagnostics(html: str, participants_count: int | None = None) -> str:
@@ -358,7 +255,6 @@ def main() -> int:
                 f"Eine Diagnose wurde gespeichert unter:\n{DEBUG_FILE}"
             )
 
-        sender_email = ensure_sender_email(root, infer_sender_email(html))
         subject, body = build_mail(session_date)
         compact = compact_summary(session_date, selected)
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -366,8 +262,11 @@ def main() -> int:
             compact + "\n\nBETREFF\n" + subject + "\n\nMAILTEXT\n" + body,
             encoding="utf-8",
         )
-        log(f"Vorschau OK: {session_date.isoformat()}, {len(selected)} Paare, {len(recipients(selected))} Empfänger")
-        show_result(root, session_date, selected, sender_email, uni_id, password, subject, body)
+        log(
+            f"Vorschau OK: {session_date.isoformat()}, "
+            f"{len(selected)} Paare, {len(recipients(selected))} Empfänger"
+        )
+        show_result(root, session_date, selected, subject, body)
         root.mainloop()
         return 0
 
