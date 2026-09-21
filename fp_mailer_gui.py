@@ -12,7 +12,7 @@ import keyring
 import requests
 
 from fp_mailer_core import (
-    fetch_live_page, parse_participants, group_participants,
+    fetch_live_page, parse_participants, diagnostic_summary, group_participants,
     choose_next_session, recipients, build_mail,
 )
 
@@ -21,6 +21,7 @@ KEYRING_SERVICE = "Heidelberg FP Mailer"
 CONFIG_DIR = Path(os.getenv("LOCALAPPDATA", Path.home())) / "FP-Mailer"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 LOG_FILE = CONFIG_DIR / "fp_mailer.log"
+DEBUG_FILE = CONFIG_DIR / "debug_parse.txt"
 
 def log(msg: str) -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -102,6 +103,15 @@ def reset_credentials(root: tk.Tk) -> None:
     except Exception as e:
         messagebox.showwarning(APP_NAME, str(e), parent=root)
 
+def save_diagnostics(html: str, participants_count: int | None = None) -> str:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    summary = diagnostic_summary(html)
+    if participants_count is not None:
+        summary += f"\n\nParser-Ergebnis: {participants_count} eingeteilte Teilnehmerzeilen"
+    DEBUG_FILE.write_text(summary, encoding="utf-8")
+    log("Parser-Diagnose:\n" + summary)
+    return summary
+
 def main() -> int:
     root = tk.Tk()
     root.withdraw()
@@ -109,8 +119,25 @@ def main() -> int:
         uni_id, password = ask_credentials(root)
         log("Start Dry-Run")
         html = fetch_live_page(uni_id, password)
-        groups = group_participants(parse_participants(html))
-        session_date, selected = choose_next_session(groups)
+        participants = parse_participants(html)
+        groups = group_participants(participants)
+
+        if not participants:
+            save_diagnostics(html, 0)
+            raise RuntimeError(
+                "Die Betreuerseite wurde geladen, aber keine Zeile mit Status 'eingeteilt' erkannt.\n\n"
+                f"Eine Diagnose ohne Passwörter wurde gespeichert unter:\n{DEBUG_FILE}"
+            )
+
+        try:
+            session_date, selected = choose_next_session(groups)
+        except RuntimeError:
+            save_diagnostics(html, len(participants))
+            raise RuntimeError(
+                "Eingeteilte Gruppen wurden erkannt, aber keine davon liegt heute oder in der Zukunft.\n\n"
+                f"Eine Diagnose wurde gespeichert unter:\n{DEBUG_FILE}"
+            )
+
         subject, body = build_mail(session_date)
         out = preview_text(session_date, selected, subject, body)
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
