@@ -60,36 +60,86 @@ def extract_mail_link_emails(row) -> set[str]:
                     found.add(addr)
     return found
 
+BETREUER_NAME_RE = re.compile(
+    r"^Betreuer\s+(E\d{2})\s+(\d{4}-\d{2}-\d{2})\s+(\d+)\s*$",
+    re.IGNORECASE,
+)
+STATUS_NAME_RE = re.compile(
+    r"^Status\s+(\d+)\s+(E\d{2})\s+(\d{4}-\d{2}-\d{2})\s*$",
+    re.IGNORECASE,
+)
+
+
 def _selected_option(select):
-    """Return the currently selected <option> of a <select> element."""
+    """Return the selected option, or the first option as a defensive fallback."""
     if select is None:
         return None
     selected = select.find("option", selected=True)
-    if selected is not None:
-        return selected
-    return select.find("option")
+    return selected if selected is not None else select.find("option")
 
 
-def _selected_status(row) -> tuple[str, str]:
-    select = row.find("select", attrs={"name": re.compile(r"^Status\\s", re.I)})
-    option = _selected_option(select)
-    if option is None:
-        return "", ""
-    return clean(option.get("value", "")).lower(), clean(option.get_text(" ", strip=True)).lower()
+def _parse_betreuer_select_name(select) -> tuple[str, date, str] | None:
+    """Extract experiment, ISO date and participant id from:
+    'Betreuer E08 2026-05-04 6437'.
+    """
+    name = clean(select.get("name", ""))
+    match = BETREUER_NAME_RE.match(name)
+    if not match:
+        return None
+    experiment, iso_date, participant_id = match.groups()
+    try:
+        session_date = datetime.strptime(iso_date, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+    return experiment.upper(), session_date, participant_id
 
 
-def _selected_supervisor(row) -> tuple[str, str]:
-    select = row.find("select", attrs={"name": re.compile(r"^Betreuer\\s", re.I)})
+def _selected_supervisor_from_select(select) -> tuple[str, str]:
     option = _selected_option(select)
     if option is None:
         return "", ""
     return clean(option.get("value", "")), clean(option.get_text(" ", strip=True))
 
 
-def _supervisor_matches(supervisor_id: str, supervisor_name: str, *, target_id: str, target_name: str) -> bool:
+def _selected_status_for_row(row, participant_id: str, experiment: str, session_date: date) -> tuple[str, str]:
+    expected_name = f"Status {participant_id} {experiment} {session_date.isoformat()}"
+    select = row.find("select", attrs={"name": expected_name})
+    if select is None:
+        # Fallback for harmless formatting differences.
+        for candidate in row.find_all("select", attrs={"name": True}):
+            if STATUS_NAME_RE.match(clean(candidate.get("name", ""))):
+                select = candidate
+                break
+    option = _selected_option(select)
+    if option is None:
+        return "", ""
+    return clean(option.get("value", "")).lower(), clean(option.get_text(" ", strip=True)).lower()
+
+
+def _supervisor_matches(
+    supervisor_id: str,
+    supervisor_name: str,
+    *,
+    target_id: str,
+    target_name: str,
+) -> bool:
     if target_id and supervisor_id == target_id:
         return True
-    return clean(supervisor_name).casefold() == clean(target_name).casefold()
+    return bool(target_name) and clean(supervisor_name).casefold() == clean(target_name).casefold()
+
+
+def _student_name_from_row(row) -> str:
+    # The mail.pl link is the most stable marker for the student name.
+    for a in row.find_all("a", href=True):
+        if "mail.pl" in urlparse(a.get("href", "")).path:
+            name = clean(a.get_text(" ", strip=True))
+            if name:
+                return name
+
+    cells = row.find_all("td")
+    if cells:
+        return clean(cells[0].get_text(" ", strip=True)) or "Unbekannt"
+    return "Unbekannt"
 
 
 def parse_participants(
@@ -99,36 +149,32 @@ def parse_participants(
     supervisor_id: str = "1370",
     supervisor_name: str = "Simon Groß-Bölting",
 ) -> list[Participant]:
-    """Parse rows assigned to this supervisor from the FP testate table.
+    """Parse assignments using the Betreuer <select> itself.
 
-    Direct table cells are:
-      td[0] student, td[1] experiment, td[2] experiment date, ...
-
-    Assignment is determined by the selected option in the Betreuer dropdown.
-    Open/future attempts normally have an empty selected Status option.
+    This deliberately does *not* depend on table-column positions. Every actual
+    participant row contains a field such as:
+        <select name="Betreuer E08 2026-05-04 6437">
+    which already encodes experiment, date and participant id.
     """
     codes = {c.upper() for c in (codes or set(DEFAULT_CODES))}
     soup = BeautifulSoup(html, "html.parser")
     participants: list[Participant] = []
 
-    for row in soup.find_all("tr"):
-        cells = row.find_all("td", recursive=False)
-        if len(cells) < 3:
-            continue
+    betreuer_selects = soup.find_all(
+        "select",
+        attrs={"name": re.compile(r"^Betreuer\s+", re.IGNORECASE)},
+    )
 
-        name = clean(cells[0].get_text(" ", strip=True))
-        experiment = clean(cells[1].get_text(" ", strip=True)).upper()
-        date_text = clean(cells[2].get_text(" ", strip=True))
+    for select in betreuer_selects:
+        parsed = _parse_betreuer_select_name(select)
+        if parsed is None:
+            continue
+        experiment, session_date, participant_id = parsed
 
         if experiment not in codes:
             continue
 
-        try:
-            session_date = parse_fp_date(date_text)
-        except ValueError:
-            continue
-
-        selected_supervisor_id, selected_supervisor_name = _selected_supervisor(row)
+        selected_supervisor_id, selected_supervisor_name = _selected_supervisor_from_select(select)
         if not _supervisor_matches(
             selected_supervisor_id,
             selected_supervisor_name,
@@ -137,7 +183,14 @@ def parse_participants(
         ):
             continue
 
-        status_value, status_text = _selected_status(row)
+        row = select.find_parent("tr")
+        if row is None:
+            continue
+
+        status_value, status_text = _selected_status_for_row(
+            row, participant_id, experiment, session_date
+        )
+        # Explicitly excluded attempt. Empty status is normal for upcoming/open attempts.
         if status_value == "nicht":
             continue
 
@@ -150,7 +203,7 @@ def parse_participants(
 
         participants.append(
             Participant(
-                name=name or "Unbekannt",
+                name=_student_name_from_row(row),
                 experiment=experiment,
                 session_date=session_date,
                 emails=emails,
@@ -172,63 +225,102 @@ def diagnostic_summary(
     codes = {c.upper() for c in (codes or set(DEFAULT_CODES))}
     soup = BeautifulSoup(html, "html.parser")
     rows = soup.find_all("tr")
+    all_selects = soup.find_all("select", attrs={"name": True})
+    betreuer_selects = [
+        s for s in all_selects
+        if clean(s.get("name", "")).lower().startswith("betreuer ")
+    ]
 
-    electronics_rows = []
+    parsed_rows = []
     supervisor_counter: Counter[str] = Counter()
-    status_counter: Counter[str] = Counter()
     date_counter: Counter[str] = Counter()
     own_rows = 0
+    valid_betreuer_names = 0
 
-    for row in rows:
-        cells = row.find_all("td", recursive=False)
-        if len(cells) < 3:
+    for select in betreuer_selects:
+        parsed = _parse_betreuer_select_name(select)
+        if parsed is None:
+            parsed_rows.append(("?", "?", "?", "<Betreuer-name nicht parsebar>", 0, False))
             continue
 
-        experiment = clean(cells[1].get_text(" ", strip=True)).upper()
+        valid_betreuer_names += 1
+        experiment, session_date, participant_id = parsed
         if experiment not in codes:
             continue
 
-        date_text = clean(cells[2].get_text(" ", strip=True))
-        try:
-            session_date = parse_fp_date(date_text)
-            d = session_date.isoformat()
-            date_counter[d] += 1
-        except ValueError:
-            d = "?"
-
-        sup_id, sup_name = _selected_supervisor(row)
+        sup_id, sup_name = _selected_supervisor_from_select(select)
         supervisor_counter[sup_id or "<leer>"] += 1
         is_own = _supervisor_matches(
-            sup_id, sup_name, target_id=supervisor_id, target_name=supervisor_name
+            sup_id,
+            sup_name,
+            target_id=supervisor_id,
+            target_name=supervisor_name,
         )
         if is_own:
             own_rows += 1
 
-        status_value, status_text = _selected_status(row)
+        date_counter[session_date.isoformat()] += 1
+        row = select.find_parent("tr")
+        if row is not None:
+            status_value, status_text = _selected_status_for_row(
+                row, participant_id, experiment, session_date
+            )
+            mail_count = len(extract_mail_link_emails(row))
+        else:
+            status_value, status_text, mail_count = "", "", 0
+
         status_label = status_value or status_text or "<leer>"
-        status_counter[status_label] += 1
-        mail_count = len(extract_mail_link_emails(row))
-        electronics_rows.append((experiment, d, sup_id or "<leer>", status_label, mail_count, is_own))
+        parsed_rows.append(
+            (
+                experiment,
+                session_date.isoformat(),
+                sup_id or "<leer>",
+                status_label,
+                mail_count,
+                is_own,
+            )
+        )
+
+    # Useful if a future server response changes the field prefix.
+    select_prefixes: Counter[str] = Counter()
+    for select in all_selects:
+        field_name = clean(select.get("name", ""))
+        prefix = field_name.split(" ", 1)[0] if field_name else "<leer>"
+        select_prefixes[prefix] += 1
 
     lines = [
         f"Lokales Datum: {date.today().isoformat()}",
         f"Tabellenzeilen gesamt: {len(rows)}",
-        f"Elektronik-Zeilen erkannt: {len(electronics_rows)}",
+        f"Select-Felder gesamt: {len(all_selects)}",
+        f"Betreuer-Selects erkannt: {len(betreuer_selects)}",
+        f"Davon Name-Schema parsebar: {valid_betreuer_names}",
+        f"Elektronik-Betreuerzeilen: {len([r for r in parsed_rows if r[0] in codes])}",
         f"Davon Betreuer {supervisor_id}: {own_rows}",
-        "Betreuer-ID-Verteilung: " + (", ".join(f"{k}={v}" for k, v in supervisor_counter.items()) or "<leer>"),
-        "Status-Verteilung: " + (", ".join(f"{k}={v}" for k, v in status_counter.items()) or "<leer>"),
-        "Erkannte Versuchstermine: " + (", ".join(f"{k} ({v} Zeilen)" for k, v in sorted(date_counter.items())) or "<keine>"),
+        "Select-Präfixe: " + (
+            ", ".join(f"{k}={v}" for k, v in select_prefixes.most_common(20))
+            or "<leer>"
+        ),
+        "Betreuer-ID-Verteilung: " + (
+            ", ".join(f"{k}={v}" for k, v in supervisor_counter.items())
+            or "<leer>"
+        ),
+        "Erkannte Versuchstermine: " + (
+            ", ".join(f"{k} ({v} Zeilen)" for k, v in sorted(date_counter.items()))
+            or "<keine>"
+        ),
         "",
-        "Erste Elektronik-Zeilen (ohne Namen/E-Mail-Adressen):",
+        "Erste Betreuer-Zeilen (ohne Namen/E-Mail-Adressen):",
     ]
-    for experiment, d, sup_id, status, mail_count, is_own in electronics_rows[:40]:
+
+    for experiment, d, sup_id, status, mail_count, is_own in parsed_rows[:40]:
         own = "JA" if is_own else "nein"
         lines.append(
-            f"- {experiment} | Datum={d} | BetreuerID={sup_id} | Eigene={own} | "
-            f"Status={status} | MailLinks={mail_count}"
+            f"- {experiment} | Datum={d} | BetreuerID={sup_id} | "
+            f"Eigene={own} | Status={status} | MailLinks={mail_count}"
         )
-    if len(electronics_rows) > 40:
-        lines.append(f"... {len(electronics_rows) - 40} weitere Zeilen")
+    if len(parsed_rows) > 40:
+        lines.append(f"... {len(parsed_rows) - 40} weitere Zeilen")
+
     return "\n".join(lines)
 
 
