@@ -1,21 +1,16 @@
 from __future__ import annotations
 
 import re
-import smtplib
-import ssl
 from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Iterable
 from urllib.parse import parse_qs, urlparse, urljoin
-from email.message import EmailMessage
 
 import requests
 from bs4 import BeautifulSoup
 
 FP_URL = "https://www.physi.uni-heidelberg.de/cgi-bin/fp/fp-testate.pl"
-SMTP_HOST = "mail.urz.uni-heidelberg.de"
-SMTP_PORT = 587
 DEFAULT_CODES = ("E01", "E06", "E07", "E08", "E09")
 GERMAN_WEEKDAYS = {
     0: "Montag", 1: "Dienstag", 2: "Mittwoch", 3: "Donnerstag",
@@ -51,19 +46,35 @@ def parse_fp_date(text: str) -> date:
             pass
     raise ValueError(f"Unbekanntes Datumsformat: {text!r}")
 
-def extract_mail_link_emails(row) -> set[str]:
+def extract_emails_from_mail_link(anchor) -> set[str]:
+    """Extract only the addresses encoded in one student's mail.pl link."""
     found: set[str] = set()
-    for a in row.find_all("a", href=True):
-        parsed = urlparse(a.get("href", ""))
-        if "mail.pl" not in parsed.path:
-            continue
-        query = parse_qs(parsed.query, keep_blank_values=True)
-        for value in query.get("email", []):
-            for addr in re.split(r"[,;]", value):
-                addr = addr.strip().lower()
-                if EMAIL_RE.match(addr):
-                    found.add(addr)
+    if anchor is None:
+        return found
+
+    href = anchor.get("href", "")
+    parsed = urlparse(href)
+    if "mail.pl" not in parsed.path:
+        return found
+
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    for value in query.get("email", []):
+        for addr in re.split(r"[,;]", value):
+            addr = addr.strip().lower()
+            if EMAIL_RE.match(addr):
+                found.add(addr)
     return found
+
+
+def _student_mail_anchor_for_select(select):
+    """Return the nearest preceding mail.pl link for this participant."""
+    anchor = select.find_previous("a", href=True)
+    while anchor is not None:
+        if "mail.pl" in urlparse(anchor.get("href", "")).path:
+            return anchor
+        anchor = anchor.find_previous("a", href=True)
+    return None
+
 
 BETREUER_NAME_RE = re.compile(
     r"^Betreuer\s+(E\d{2})\s+(\d{4}-\d{2}-\d{2})\s+(\d+)\s*$",
@@ -133,18 +144,10 @@ def _supervisor_matches(
     return bool(target_name) and clean(supervisor_name).casefold() == clean(target_name).casefold()
 
 
-def _student_name_from_row(row) -> str:
-    # The mail.pl link is the most stable marker for the student name.
-    for a in row.find_all("a", href=True):
-        if "mail.pl" in urlparse(a.get("href", "")).path:
-            name = clean(a.get_text(" ", strip=True))
-            if name:
-                return name
-
-    cells = row.find_all("td")
-    if cells:
-        return clean(cells[0].get_text(" ", strip=True)) or "Unbekannt"
-    return "Unbekannt"
+def _student_name_from_anchor(anchor) -> str:
+    if anchor is None:
+        return "Unbekannt"
+    return clean(anchor.get_text(" ", strip=True)) or "Unbekannt"
 
 
 def parse_participants(
@@ -189,17 +192,16 @@ def parse_participants(
             continue
 
         row = select.find_parent("tr")
-        if row is None:
-            continue
-
-        status_value, status_text = _selected_status_for_row(
-            row, participant_id, experiment, session_date
-        )
-        # Explicitly excluded attempt. Empty status is normal for upcoming/open attempts.
+        status_value, status_text = ("", "")
+        if row is not None:
+            status_value, status_text = _selected_status_for_row(
+                row, participant_id, experiment, session_date
+            )
         if status_value == "nicht":
             continue
 
-        emails = tuple(sorted(extract_mail_link_emails(row)))
+        mail_anchor = _student_mail_anchor_for_select(select)
+        emails = tuple(sorted(extract_emails_from_mail_link(mail_anchor)))
         if not emails:
             raise RuntimeError(
                 f"Zugeordneter Eintrag ohne erkennbare E-Mail-Adresse: "
@@ -396,46 +398,6 @@ def infer_sender_email(html: str) -> str | None:
                         return addr
     return None
 
-
-def send_email_via_uni_smtp(
-    *,
-    sender_email: str,
-    uni_id: str,
-    password: str,
-    recipient_emails: list[str],
-    subject: str,
-    body: str,
-    timeout: int = 30,
-) -> None:
-    """Send one message through Heidelberg University's SMTP server."""
-    if not EMAIL_RE.match(sender_email):
-        raise ValueError(f"Ungültige Absenderadresse: {sender_email!r}")
-    recipient_emails = sorted({
-        e.strip().lower()
-        for e in recipient_emails
-        if EMAIL_RE.match(e.strip())
-    })
-    if not recipient_emails:
-        raise ValueError("Keine gültigen Empfängeradressen vorhanden.")
-    if not subject.strip():
-        raise ValueError("Der Betreff ist leer.")
-    if not body.strip():
-        raise ValueError("Der Mailtext ist leer.")
-
-    msg = EmailMessage()
-    msg["From"] = sender_email
-    msg["To"] = sender_email
-    msg["Bcc"] = ", ".join(recipient_emails)
-    msg["Subject"] = subject.strip()
-    msg.set_content(body.rstrip() + "\n")
-
-    context = ssl.create_default_context()
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=timeout) as smtp:
-        smtp.ehlo()
-        smtp.starttls(context=context)
-        smtp.ehlo()
-        smtp.login(uni_id, password)
-        smtp.send_message(msg)
 
 def looks_logged_in(html: str) -> bool:
     soup = BeautifulSoup(html, "html.parser")
