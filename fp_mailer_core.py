@@ -203,7 +203,7 @@ def parse_participants(
 
         participants.append(
             Participant(
-                name=_student_name_from_row(row),
+                name=_student_name_from_anchor(mail_anchor),
                 experiment=experiment,
                 session_date=session_date,
                 emails=emails,
@@ -265,7 +265,9 @@ def diagnostic_summary(
             status_value, status_text = _selected_status_for_row(
                 row, participant_id, experiment, session_date
             )
-            mail_count = len(extract_mail_link_emails(row))
+            mail_count = len(
+                extract_emails_from_mail_link(_student_mail_anchor_for_select(select))
+            )
         else:
             status_value, status_text, mail_count = "", "", 0
 
