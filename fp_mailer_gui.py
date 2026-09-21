@@ -107,7 +107,7 @@ def save_diagnostics(html: str, participants_count: int | None = None) -> str:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     summary = diagnostic_summary(html)
     if participants_count is not None:
-        summary += f"\n\nParser-Ergebnis: {participants_count} eingeteilte Teilnehmerzeilen"
+        summary += f"\n\nParser-Ergebnis: {participants_count} dir zugeordnete Teilnehmerzeilen"
     DEBUG_FILE.write_text(summary, encoding="utf-8")
     log("Parser-Diagnose:\n" + summary)
     return summary
@@ -125,7 +125,7 @@ def main() -> int:
         if not participants:
             save_diagnostics(html, 0)
             raise RuntimeError(
-                "Die Betreuerseite wurde geladen, aber keine Zeile mit Status 'eingeteilt' erkannt.\n\n"
+                "Die Betreuerseite wurde geladen, aber keine Elektronik-Zeile mit dir als ausgewähltem Betreuer erkannt.\n\n"
                 f"Eine Diagnose ohne Passwörter wurde gespeichert unter:\n{DEBUG_FILE}"
             )
 
@@ -134,7 +134,7 @@ def main() -> int:
         except RuntimeError:
             save_diagnostics(html, len(participants))
             raise RuntimeError(
-                "Eingeteilte Gruppen wurden erkannt, aber keine davon liegt heute oder in der Zukunft.\n\n"
+                "Dir zugeordnete Gruppen wurden erkannt, aber keine davon liegt heute oder in der Zukunft.\n\n"
                 f"Eine Diagnose wurde gespeichert unter:\n{DEBUG_FILE}"
             )
 
