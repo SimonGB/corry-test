@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Local/debug files
+*.log
+last_preview.txt
+config.json
+.env
+
+# Snapshots may contain participant data
+*.mht
+*.mhtml
+FP-Betreuerseite*
