@@ -150,6 +150,21 @@ def _student_name_from_anchor(anchor) -> str:
     return clean(anchor.get_text(" ", strip=True)) or "Unbekannt"
 
 
+def list_supervisors(html: str) -> list[tuple[str, str]]:
+    """Return unique (supervisor_id, supervisor_name) options from the FP page."""
+    soup = BeautifulSoup(html, "html.parser")
+    supervisors: dict[str, str] = {}
+    for select in soup.find_all(
+        "select", attrs={"name": re.compile(r"^Betreuer\s+", re.IGNORECASE)}
+    ):
+        for option in select.find_all("option"):
+            supervisor_id = clean(option.get("value", ""))
+            supervisor_name = clean(option.get_text(" ", strip=True))
+            if supervisor_id and supervisor_name:
+                supervisors[supervisor_id] = supervisor_name
+    return sorted(supervisors.items(), key=lambda item: item[1].casefold())
+
+
 def parse_participants(
     html: str,
     codes: set[str] | None = None,
@@ -360,10 +375,11 @@ def recipients(groups: Iterable[Group]) -> list[str]:
         out.update(g.emails)
     return sorted(out)
 
-def build_mail(session_date: date) -> tuple[str, str]:
+def build_mail(session_date: date, signature_name: str = "") -> tuple[str, str]:
     weekday = GERMAN_WEEKDAYS[session_date.weekday()]
     pretty = session_date.strftime("%d.%m.%Y")
     subject = f'FP-Versuch "Elektroniker-Grundpraktikum" – {weekday}, {pretty}'
+    signature = clean(signature_name) or "FP-Betreuung"
     body = f"""Moin zusammen,
 
 für den FP-Versuch „Elektroniker-Grundpraktikum“ treffen wir uns am {weekday}, den {pretty}, um 09:00 Uhr am INF 501.
@@ -377,7 +393,7 @@ Bitte denkt daran, euch vorher entsprechend vorzubereiten:
 Dann können wir direkt mit dem Versuch starten.
 
 Viele Grüße
-Simon
+{signature}
 """
     return subject, body
 
