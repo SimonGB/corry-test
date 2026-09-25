@@ -78,6 +78,48 @@ def _default_signature(supervisor_name: str) -> str:
     return parts[0] if parts else supervisor_name.strip()
 
 
+def clear_root(root: tk.Tk) -> None:
+    for child in root.winfo_children():
+        try:
+            child.destroy()
+        except Exception:
+            pass
+
+
+def show_loading(root: tk.Tk, message: str) -> None:
+    clear_root(root)
+    root.deiconify()
+    root.title("FP Mailer")
+    root.geometry("500x170")
+    root.minsize(440, 150)
+    root.resizable(True, False)
+
+    frame = ttk.Frame(root, padding=18)
+    frame.pack(fill="both", expand=True)
+
+    ttk.Label(
+        frame,
+        text="FP Mailer",
+        font=("Segoe UI", 15, "bold"),
+    ).pack(anchor="w")
+
+    label = ttk.Label(
+        frame,
+        text=message,
+        font=("Segoe UI", 10),
+        wraplength=450,
+        justify="left",
+    )
+    label.pack(anchor="w", pady=(10, 12))
+
+    bar = ttk.Progressbar(frame, mode="indeterminate")
+    bar.pack(fill="x")
+    bar.start(12)
+
+    root.update_idletasks()
+    root.update()
+
+
 def choose_profile(root: tk.Tk, html: str, force: bool = False) -> dict:
     cfg = load_config()
     existing = cfg.get("profile") or {}
@@ -98,6 +140,12 @@ def choose_profile(root: tk.Tk, html: str, force: bool = False) -> dict:
     dialog.resizable(False, False)
     dialog.transient(root)
     dialog.grab_set()
+    dialog.lift()
+    try:
+        dialog.attributes("-topmost", True)
+        dialog.after(300, lambda: dialog.attributes("-topmost", False))
+    except Exception:
+        pass
 
     frame = ttk.Frame(dialog, padding=16)
     frame.grid(row=0, column=0, sticky="nsew")
@@ -190,7 +238,10 @@ def choose_profile(root: tk.Tk, html: str, force: bool = False) -> dict:
     x = root.winfo_screenwidth() // 2 - dialog.winfo_reqwidth() // 2
     y = root.winfo_screenheight() // 2 - dialog.winfo_reqheight() // 2
     dialog.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+    dialog.lift()
+    dialog.focus_force()
     combo.focus_set()
+    log("Profilauswahl sichtbar")
     root.wait_window(dialog)
 
     if not result:
@@ -292,6 +343,7 @@ def change_profile(root: tk.Tk, html: str) -> None:
 
 
 def show_result(root: tk.Tk, html: str, profile: dict, session_date, groups, subject: str, body: str) -> None:
+    clear_root(root)
     root.deiconify()
     root.title("FP Mailer – Vorschau")
     root.geometry("860x650")
@@ -423,15 +475,28 @@ def main() -> int:
 
         uni_id, password = ask_credentials(root)
         log("Start")
-        html = fetch_live_page(uni_id, password)
-        profile = choose_profile(root, html)
 
+        show_loading(root, "FP-Seite wird geladen und Anmeldung wird geprüft …")
+        log("FP-Seite wird geladen")
+        html = fetch_live_page(uni_id, password)
+        log("FP-Seite geladen")
+
+        show_loading(root, "Betreuerprofil wird vorbereitet …")
+        log("Profilauswahl wird vorbereitet")
+        profile = choose_profile(root, html)
+        log(
+            f"Profil gewählt: {profile['supervisor_name']} "
+            f"(ID {profile['supervisor_id']})"
+        )
+
+        show_loading(root, f"Versuchspaare für {profile['supervisor_name']} werden ausgewertet …")
         participants = parse_participants(
             html,
             supervisor_id=str(profile["supervisor_id"]),
             supervisor_name=profile["supervisor_name"],
         )
         groups = group_participants(participants)
+        log(f"Gruppen ausgewertet: {len(participants)} Teilnehmerzeilen, {len(groups)} Gruppen")
         if not participants:
             save_diagnostics(html, profile, 0)
             raise RuntimeError(
@@ -448,6 +513,10 @@ def main() -> int:
                 f"Diagnose:\n{DEBUG_FILE}"
             )
 
+        log(
+            f"Nächster Termin gewählt: {session_date.isoformat()}, "
+            f"{len(selected)} Versuchspaare, {len(recipients(selected))} Empfänger"
+        )
         subject, body = build_mail(session_date, profile.get("signature_name", ""))
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         (CONFIG_DIR / "last_preview.txt").write_text(
