@@ -260,7 +260,7 @@ def build_mailto_uri(recips: list[str], subject: str, body: str) -> str:
 
     query = urlencode(
         {
-            "bcc": ",".join(recips),
+            "bcc": ";".join(recips),
             "subject": subject.strip(),
             "body": body.rstrip(),
         },
